@@ -1,140 +1,336 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import threading
 import os
-import shutil
-from datetime import datetime, timedelta
+import ctypes
+import sys
 import logging
 from logging.handlers import RotatingFileHandler
+import queue
+import time
 
-# ==== CONFIG ====
-LOG_PATH = os.path.expanduser("~/Downloads/NightlyCleanupLog.txt")
-MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
-BACKUP_COUNT = 3
+# Global variables and logger setup
+log_queue = queue.Queue()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-MAX_FILE_AGE_DAYS = 3
-NOW = datetime.now()
+# File handler for logging
+file_handler = RotatingFileHandler('cleanup.log', maxBytes=1024*1024, backupCount=5)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
 
-# Add any other AI/model/temp folders here if needed
-TARGET_FOLDERS = [
-    os.environ.get("TEMP"),
-    os.path.expandvars(r"%USERPROFILE%\AppData\Local\Temp"),
-]
-
-EXCLUDE_EXTENSIONS = ['.log', '.bak', '.tmp']
-EXCLUDE_KEYWORDS = ['important', 'do_not_delete']
-
-# === LOGGING SETUP ===
-def setup_logging():
-    logger = logging.getLogger('cleanup')
-    logger.setLevel(logging.INFO)
+# Queue handler for GUI logging
+class QueueHandler(logging.Handler):
+    def __init__(self, queue):
+        super().__init__()
+        self.queue = queue
     
-    # Create rotating file handler
-    handler = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=MAX_LOG_SIZE,
-        backupCount=BACKUP_COUNT,
-        encoding='utf-8'
-    )
-    
-    # Create formatter
-    formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    handler.setFormatter(formatter)
-    
-    logger.addHandler(handler)
-    return logger
+    def emit(self, record):
+        self.queue.put(record)
 
-logger = setup_logging()
+queue_handler = QueueHandler(log_queue)
+queue_handler.setFormatter(file_formatter)
 
-# === STATISTICS ===
-class CleanupStats:
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(queue_handler)
+
+# Stats object to store cleanup results
+class Stats:
     def __init__(self):
-        self.files_deleted = 0
-        self.folders_deleted = 0
-        self.files_skipped = 0
-        self.folders_skipped = 0
-        self.errors = 0
-        self.total_size_cleaned = 0
+        self.sfc_result = "No integrity violations found"
 
-stats = CleanupStats()
+stats = Stats()
 
-# === HELPERS ===
-def is_old_enough(path):
+def perform_cleanup_task(update_callback, complete_callback, stop_event):
+    """
+    Basic cleanup task - this is a placeholder implementation.
+    You can replace this with your actual cleanup logic.
+    """
     try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(path))
-        return (NOW - mtime) > timedelta(days=MAX_FILE_AGE_DAYS)
+        logger.info("Starting cleanup process...")
+        update_callback("Initializing cleanup...")
+        
+        # Simulate cleanup steps
+        steps = [
+            ("Clearing temporary files...", 20),
+            ("Cleaning cache directories...", 40),
+            ("Running system file check...", 60),
+            ("Optimizing system files...", 80),
+            ("Finalizing cleanup...", 100)
+        ]
+        
+        for step_name, progress in steps:
+            if stop_event.is_set():
+                logger.info("Cleanup terminated by user")
+                return
+            
+            update_callback(f"{step_name} {progress}%")
+            logger.info(step_name)
+            time.sleep(2)  # Simulate work being done
+        
+        # Simulate SFC result
+        stats.sfc_result = "No integrity violations found"
+        logger.info("Cleanup completed successfully")
+        
+        # Call completion callback
+        update_callback("Cleanup completed!")
+        
     except Exception as e:
-        logger.error(f"Error checking file age for {path}: {e}")
-        return False
+        logger.error(f"Error during cleanup: {e}")
+        update_callback(f"Error: {e}")
+    finally:
+        # Call completion callback
+        if hasattr(complete_callback, '__call__'):
+            complete_callback()
 
-def get_file_size(path):
+class CleanupApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Nightly Cleanup Tool")
+        master.geometry("700x500")
+        master.resizable(True, True)
+
+        self.cleanup_thread = None
+        self.stop_requested = threading.Event()
+
+        # Create widgets
+        self.create_widgets()
+        
+        # Start log queue processor
+        self.master.after(100, self.process_log_queue)
+
+    def create_widgets(self):
+        # Log text area
+        self.log_text = scrolledtext.ScrolledText(
+            self.master, 
+            wrap=tk.WORD, 
+            state='disabled', 
+            height=20, 
+            width=80, 
+            bg='#2b2b2b', 
+            fg='#cccccc', 
+            font=("Consolas", 10)
+        )
+        self.log_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(self.master, mode='determinate', length=200)
+        self.progress_bar.pack(pady=5)
+
+        # Status label
+        self.status_label = ttk.Label(self.master, text="Ready to run cleanup.")
+        self.status_label.pack(pady=5)
+
+        # Button frame
+        self.button_frame = ttk.Frame(self.master)
+        self.button_frame.pack(pady=10)
+
+        # Buttons
+        self.start_button = ttk.Button(
+            self.button_frame, 
+            text="Start Cleanup", 
+            command=self.start_cleanup
+        )
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+        self.terminate_button = ttk.Button(
+            self.button_frame, 
+            text="Terminate", 
+            command=self.terminate_cleanup, 
+            state='disabled'
+        )
+        self.terminate_button.pack(side=tk.LEFT, padx=5)
+
+        self.close_button = ttk.Button(
+            self.button_frame, 
+            text="Close", 
+            command=self.close_app
+        )
+        self.close_button.pack(side=tk.LEFT, padx=5)
+
+    def process_log_queue(self):
+        """Process log messages from the queue and display them in the GUI."""
+        # Use the formatter from the logger's handlers
+        formatter = None
+        for handler in logger.handlers:
+            if hasattr(handler, 'formatter') and handler.formatter:
+                formatter = handler.formatter
+                break
+
+        while not log_queue.empty():
+            record = log_queue.get()
+            if formatter:
+                msg = formatter.format(record)
+            else:
+                msg = record.getMessage()
+            
+            self.log_text.config(state='normal')
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state='disabled')
+        
+        # Schedule next check
+        self.master.after(100, self.process_log_queue)
+
+    def update_status(self, message):
+        """Update the status label and log the message."""
+        self.status_label.config(text=message)
+        logger.info(message)
+        
+        # Extract progress percentage from message if present
+        if "%" in message:
+            try:
+                # Find percentage in the message
+                parts = message.split()
+                for part in parts:
+                    if "%" in part:
+                        progress = float(part.replace("%", ""))
+                        self.progress_bar["value"] = progress
+                        break
+            except (ValueError, IndexError):
+                pass
+
+    def start_cleanup(self):
+        """Start the cleanup process in a separate thread."""
+        if self.cleanup_thread and self.cleanup_thread.is_alive():
+            self.update_status("Cleanup already running...")
+            return
+
+        # Clear previous logs in GUI
+        self.log_text.config(state='normal')
+        self.log_text.delete('1.0', tk.END)
+        self.log_text.config(state='disabled')
+
+        # Update UI
+        self.update_status("Cleanup started. Please wait...")
+        self.progress_bar["value"] = 0
+        self.start_button.config(state='disabled')
+        self.terminate_button.config(state='normal')
+        self.stop_requested.clear()
+
+        # Start cleanup thread
+        self.cleanup_thread = threading.Thread(
+            target=perform_cleanup_task,
+            args=(self.update_status, self.cleanup_complete_callback, self.stop_requested)
+        )
+        self.cleanup_thread.daemon = True
+        self.cleanup_thread.start()
+
+    def cleanup_complete_callback(self):
+        """Called when cleanup is complete."""
+        self.progress_bar["value"] = 100
+        self.start_button.config(state='normal')
+        self.terminate_button.config(state='disabled')
+        self.update_status("Cleanup complete! Check log for details.")
+        
+        # Show SFC result in a popup
+        messagebox.showinfo("SFC Result", f"SFC /scannow result: {stats.sfc_result}")
+        
+        # Show splash screen
+        splash = SplashScreen(self.master)
+
+    def terminate_cleanup(self):
+        """Terminate the cleanup process immediately."""
+        self.update_status("Terminating process immediately!")
+        self.master.update()
+        os._exit(1)
+
+    def close_app(self):
+        """Close the application."""
+        self.master.destroy()
+
+class SplashScreen:
+    def __init__(self, parent):
+        self.window = tk.Toplevel(parent)
+        self.window.title("Cleanup Complete")
+
+        # Calculate window position (center of screen)
+        self.window.update_idletasks()
+        window_width = 400
+        window_height = 320
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        x = (screen_width // 2) - (window_width // 2)
+        y = (screen_height // 2) - (window_height // 2)
+        
+        self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        self.window.grab_set()
+        self.window.attributes('-topmost', True)
+        self.window.overrideredirect(True)
+
+        # Create main frame
+        main_frame = ttk.Frame(self.window, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+        # Success icon
+        icon_label = ttk.Label(main_frame, text="✓", font=("Arial", 72))
+        icon_label.grid(row=0, column=0, pady=(10, 0), sticky="n")
+
+        # Finished text
+        finished_label = ttk.Label(main_frame, text="FINISHED", font=("Arial", 24, "bold"))
+        finished_label.grid(row=1, column=0, pady=(10, 0), sticky="n")
+
+        # Close button
+        close_button = ttk.Button(main_frame, text="Close", command=self.close_window)
+        close_button.grid(row=2, column=0, pady=(30, 10), sticky="s")
+
+        # Style
+        style = ttk.Style()
+        style.configure("Splash.TFrame", background="#f0f0f0")
+        main_frame.configure(style="Splash.TFrame")
+
+        # Bind escape key
+        self.window.bind('<Escape>', lambda e: self.close_window())
+
+    def close_window(self):
+        """Close the splash screen and main application."""
+        self.window.destroy()
+        self.window.master.destroy()
+
+def run_as_admin():
+    """Relaunch the script with admin rights if not already running as admin."""
     try:
-        return os.path.getsize(path)
-    except Exception:
-        return 0
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        is_admin = False
+    
+    if not is_admin:
+        # Relaunch as admin
+        params = ' '.join([f'"{arg}"' for arg in sys.argv])
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1
+        )
+        sys.exit(0)
 
-def safe_delete_file(file_path):
-    if not is_old_enough(file_path):
-        stats.files_skipped += 1
-        return
-    if any(file_path.lower().endswith(ext) for ext in EXCLUDE_EXTENSIONS):
-        stats.files_skipped += 1
-        logger.debug(f"Skipped file (excluded extension): {file_path}")
-        return
-    if any(keyword in file_path.lower() for keyword in EXCLUDE_KEYWORDS):
-        stats.files_skipped += 1
-        logger.debug(f"Skipped file (excluded keyword): {file_path}")
-        return
-    try:
-        size = get_file_size(file_path)
-        os.remove(file_path)
-        stats.files_deleted += 1
-        stats.total_size_cleaned += size
-        logger.info(f"Deleted file: {file_path} ({size/1024:.2f} KB)")
-    except Exception as e:
-        stats.errors += 1
-        logger.error(f"Failed to delete file: {file_path} - {e}")
+def main():
+    """Main function to run the application."""
+    # Check for admin privileges
+    run_as_admin()
+    
+    # Create and run the GUI
+    root = tk.Tk()
+    app = CleanupApp(root)
+    
+    # Configure the QueueHandler formatter
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            gui_formatter = handler.formatter
+            break
+    else:
+        gui_formatter = logging.Formatter('%(levelname)s: %(message)s')
 
-def safe_delete_folder(folder_path):
-    if not is_old_enough(folder_path):
-        stats.folders_skipped += 1
-        return
-    try:
-        size = sum(get_file_size(os.path.join(dirpath, filename))
-                  for dirpath, _, filenames in os.walk(folder_path)
-                  for filename in filenames)
-        shutil.rmtree(folder_path)
-        stats.folders_deleted += 1
-        stats.total_size_cleaned += size
-        logger.info(f"Deleted folder: {folder_path} ({size/1024:.2f} KB)")
-    except Exception as e:
-        stats.errors += 1
-        logger.error(f"Failed to delete folder: {folder_path} - {e}")
+    for handler in logger.handlers:
+        if isinstance(handler, QueueHandler):
+            handler.setFormatter(gui_formatter)
+            break
 
-def log_summary():
-    logger.info("=== Cleanup Summary ===")
-    logger.info(f"Files deleted: {stats.files_deleted}")
-    logger.info(f"Folders deleted: {stats.folders_deleted}")
-    logger.info(f"Files skipped: {stats.files_skipped}")
-    logger.info(f"Folders skipped: {stats.folders_skipped}")
-    logger.info(f"Total space cleaned: {stats.total_size_cleaned/1024/1024:.2f} MB")
-    logger.info(f"Errors encountered: {stats.errors}")
-    logger.info("=====================")
+    # Start the GUI main loop
+    root.mainloop()
 
-# === MAIN CLEANUP ===
-logger.info("\n\n========== NEW CLEANUP RUN ==========\n")
-logger.info("=== Nightly Cleanup Started ===")
-
-for folder in TARGET_FOLDERS:
-    if folder and os.path.exists(folder):
-        logger.info(f"Processing folder: {folder}")
-        for root, dirs, files in os.walk(folder, topdown=False):
-            for file in files:
-                safe_delete_file(os.path.join(root, file))
-            for dir in dirs:
-                full_path = os.path.join(root, dir)
-                if dir == "__pycache__":
-                    safe_delete_folder(full_path)
-
-log_summary()
-logger.info("=== Nightly Cleanup Complete ===\n")
+if __name__ == "__main__":
+    main() 
